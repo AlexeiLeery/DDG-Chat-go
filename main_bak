@@ -1,5 +1,7 @@
 package main
 
+// DDG-Chat-go - 使用硬编码token，支持多轮对话
+
 import (
 	"bufio"
 	"encoding/json"
@@ -31,25 +33,25 @@ func init() {
 	godotenv.Load()
 	config = Config{
 		APIPrefix:     getEnv("API_PREFIX", "/"),
-			MaxRetryCount: getIntEnv("MAX_RETRY_COUNT", 3),
-			RetryDelay:    getDurationEnv("RETRY_DELAY", 5000),
-			ProxyURL:      getEnv("PROXY_URL", ""),
-			FakeHeaders: map[string]string{
-				"Accept":             "*/*",
-				"Accept-Encoding":    "gzip, deflate, br, zstd",
-				"Accept-Language":    "zh-CN,zh;q=0.9",
-				"Origin":             "https://duckduckgo.com/",
-				"Cookie":             "dcs=1; dcm=8",
-				"Priority":           "u=1, i",
-				"Referer":            "https://duckduckgo.com/",
-				"Sec-Ch-Ua":          `"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"`,
-				"Sec-Ch-Ua-Mobile":   "?0",
-				"Sec-Ch-Ua-Platform": `"Windows"`,
-				"Sec-Fetch-Dest":     "empty",
-				"Sec-Fetch-Mode":     "cors",
-				"Sec-Fetch-Site":     "same-origin",
-				"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-			},
+		MaxRetryCount: getIntEnv("MAX_RETRY_COUNT", 3),
+		RetryDelay:    getDurationEnv("RETRY_DELAY", 5000),
+		ProxyURL:      getEnv("PROXY_URL", ""),
+		FakeHeaders: map[string]string{
+			"Accept":             "*/*",
+			"Accept-Encoding":    "gzip, deflate, br, zstd",
+			"Accept-Language":    "zh-CN,zh;q=0.9",
+			"Origin":             "https://duckduckgo.com/",
+			"Cookie":             "dcm=3; dcs=1",
+			"Priority":           "u=1, i",
+			"Referer":            "https://duckduckgo.com/",
+			"Sec-Ch-Ua":          `"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"`,
+			"Sec-Ch-Ua-Mobile":   "?0",
+			"Sec-Ch-Ua-Platform": `"Windows"`,
+			"Sec-Fetch-Dest":     "empty",
+			"Sec-Fetch-Mode":     "cors",
+			"Sec-Fetch-Site":     "same-origin",
+			"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+		},
 	}
 }
 
@@ -125,35 +127,7 @@ func handleCompletion(c *gin.Context) {
 	}
 
 	model := convertModel(req.Model)
-	
-	// 构建请求消息数组，保留对话历史
-	var messages []map[string]interface{}
-	
-	// 处理所有消息，保持与curl示例相同的格式
-	for _, msg := range req.Messages {
-		content := ""
-		switch v := msg.Content.(type) {
-		case string:
-			content = v
-		case []interface{}:
-			var sb strings.Builder
-			for _, item := range v {
-				if itemMap, ok := item.(map[string]interface{}); ok {
-					if text, exists := itemMap["text"].(string); exists {
-						sb.WriteString(text)
-					}
-				}
-			}
-			content = sb.String()
-		default:
-			content = fmt.Sprintf("%v", msg.Content)
-		}
-		
-		messages = append(messages, map[string]interface{}{
-			"role":    msg.Role,
-			"content": content,
-		})
-	}
+	content := prepareMessages(req.Messages)
 
 	var retryCount = 0
 	var lastError error
@@ -171,10 +145,22 @@ func handleCompletion(c *gin.Context) {
 			continue
 		}
 
-		// 构建请求体，完全匹配curl示例格式
+		// 根据是第一次对话还是持续对话，动态更新token
+		// 第一次对话使用第一个curl示例的token，后续对话使用第二个curl示例的token
+		if len(req.Messages) > 1 {
+			// 如果存在对话历史，使用第二个curl示例中的token
+			token = "4-212890776487765339064984812855765849703"
+			log.Printf("检测到多轮对话，使用多轮对话token: %s", token)
+		}
+
 		reqBody := map[string]interface{}{
-			"model":    model,
-			"messages": messages,
+			"model": model,
+			"messages": []map[string]interface{}{
+				{
+					"role":    "user",
+					"content": content,
+				},
+			},
 		}
 
 		body, err := json.Marshal(reqBody)
@@ -183,49 +169,21 @@ func handleCompletion(c *gin.Context) {
 			return
 		}
 
-		log.Printf("发送聊天请求，模型: %s, 消息数量: %d", model, len(messages))
-		
 		upstreamReq, err := http.NewRequest("POST", "https://duckduckgo.com/duckchat/v1/chat", strings.NewReader(string(body)))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("创建请求失败: %v", err)})
 			return
 		}
 
-		// 设置与curl相同的headers
-		upstreamReq.Header.Set("Accept", "text/event-stream")
-		upstreamReq.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+		for k, v := range config.FakeHeaders {
+			upstreamReq.Header.Set(k, v)
+		}
+		upstreamReq.Header.Set("x-vqd-4", token)
+		if vqdHash != "" {
+			upstreamReq.Header.Set("x-vqd-hash-1", vqdHash)
+		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
-		upstreamReq.Header.Set("Cookie", "dcs=1; dcm=8")
-		upstreamReq.Header.Set("Origin", "https://duckduckgo.com")
-		upstreamReq.Header.Set("Priority", "u=1, i")
-		upstreamReq.Header.Set("Referer", "https://duckduckgo.com/")
-		upstreamReq.Header.Set("Sec-Ch-Ua", `"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"`)
-		upstreamReq.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-		upstreamReq.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-		upstreamReq.Header.Set("Sec-Fetch-Dest", "empty")
-		upstreamReq.Header.Set("Sec-Fetch-Mode", "cors") 
-		upstreamReq.Header.Set("Sec-Fetch-Site", "same-origin")
-		upstreamReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
-		upstreamReq.Header.Set("X-Vqd-4", token)
-		upstreamReq.Header.Set("X-Vqd-Hash-1", vqdHash)
-
-		// 根据是第一次对话还是持续对话，动态更新token
-		// 第一次对话使用第一个curl示例的token，后续对话使用第二个curl示例的token
-		if len(messages) > 1 {
-			// 如果存在对话历史，使用第二个curl示例中的token
-			upstreamReq.Header.Set("X-Vqd-4", "4-212890776487765339064984812855765849703")
-		}
-
-		// 打印请求头以便调试
-		log.Println("请求头信息:")
-		for name, values := range upstreamReq.Header {
-			for _, value := range values {
-				log.Printf("  %s: %s", name, value)
-			}
-		}
-
-		// 打印请求体以便调试
-		log.Printf("请求体: %s", string(body))
+		upstreamReq.Header.Set("Accept", "text/event-stream")
 
 		client := createHTTPClient(30 * time.Second)
 		resp, err := client.Do(upstreamReq)
@@ -236,20 +194,9 @@ func handleCompletion(c *gin.Context) {
 		}
 		defer resp.Body.Close()
 
-		// 记录响应头以便调试
-		log.Printf("聊天请求响应状态码: %d", resp.StatusCode)
-		log.Println("响应头信息:")
-		for name, values := range resp.Header {
-			for _, value := range values {
-				log.Printf("  %s: %s", name, value)
-			}
-		}
-
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			bodyString := string(bodyBytes)
-			log.Printf("聊天请求非200响应: %d, 内容: %s\n", resp.StatusCode, bodyString)
-			lastError = fmt.Errorf("非200响应: %d, 内容: %s", resp.StatusCode, bodyString)
+			lastError = fmt.Errorf("非200响应: %d, 内容: %s", resp.StatusCode, string(bodyBytes))
 			retryCount++
 			continue
 		}
@@ -261,12 +208,10 @@ func handleCompletion(c *gin.Context) {
 			continue
 		}
 
-		log.Printf("成功处理聊天请求")
 		return
 	}
 
 	// 如果所有重试都失败了
-	log.Printf("所有重试都失败，最后错误: %v", lastError)
 	c.JSON(http.StatusInternalServerError, gin.H{"error": lastError.Error()})
 }
 
@@ -297,9 +242,6 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 			break
 		}
 
-		// 记录原始响应行用于调试
-		log.Printf("原始响应行: %s", line)
-
 		if strings.HasPrefix(line, "data: ") {
 			line = strings.TrimPrefix(line, "data: ")
 			line = strings.TrimSpace(line)
@@ -328,45 +270,39 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 
 			var chunk map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-				log.Printf("解析响应行失败: %v, 内容: %s", err, line)
+				log.Printf("解析响应行失败: %v", err)
 				continue
 			}
 
-			log.Printf("解析的响应块: %+v", chunk)
+			if chunk["action"] != "success" {
+				continue
+			}
 
-			// 处理DuckDuckGo的响应格式
-			if chunk["action"] == "success" {
-				var msgContent string
-				if msg, exists := chunk["message"]; exists && msg != nil {
-					if msgStr, ok := msg.(string); ok {
-						msgContent = msgStr
-					}
-				}
-
-				response := map[string]interface{}{
-					"id":      "chatcmpl-QXlha2FBbmROaXhpZUFyZUF3ZXNvbWUK",
-					"object":  "chat.completion.chunk",
-					"created": time.Now().Unix(),
-					"model":   model,
-					"choices": []map[string]interface{}{
-						{
-							"index": 0,
-							"delta": map[string]string{
-								"content": msgContent,
+			if msg, exists := chunk["message"]; exists && msg != nil {
+				if msgStr, ok := msg.(string); ok {
+					response := map[string]interface{}{
+						"id":      "chatcmpl-QXlha2FBbmROaXhpZUFyZUF3ZXNvbWUK",
+						"object":  "chat.completion.chunk",
+						"created": time.Now().Unix(),
+						"model":   model,
+						"choices": []map[string]interface{}{
+							{
+								"index": 0,
+								"delta": map[string]string{
+									"content": msgStr,
+								},
+								"finish_reason": nil,
 							},
-							"finish_reason": nil,
 						},
-					},
-				}
-				sseData, _ := json.Marshal(response)
-				sseMessage := fmt.Sprintf("data: %s\n\n", sseData)
+					}
+					sseData, _ := json.Marshal(response)
+					sseMessage := fmt.Sprintf("data: %s\n\n", sseData)
 
-				if _, err := c.Writer.Write([]byte(sseMessage)); err != nil {
-					return fmt.Errorf("写入响应失败: %v", err)
+					if _, err := c.Writer.Write([]byte(sseMessage)); err != nil {
+						return fmt.Errorf("写入响应失败: %v", err)
+					}
+					flusher.Flush()
 				}
-				flusher.Flush()
-			} else {
-				log.Printf("非success响应: %+v", chunk)
 			}
 		}
 	}
@@ -385,9 +321,6 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, model string) 
 			return fmt.Errorf("读取响应失败: %v", err)
 		}
 
-		// 记录原始响应行用于调试
-		log.Printf("原始响应行: %s", line)
-
 		if strings.HasPrefix(line, "data: ") {
 			line = strings.TrimPrefix(line, "data: ")
 			line = strings.TrimSpace(line)
@@ -398,21 +331,18 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, model string) 
 
 			var chunk map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-				log.Printf("解析响应行失败: %v, 内容: %s", err, line)
+				log.Printf("解析响应行失败: %v", err)
 				continue
 			}
 
-			log.Printf("解析的响应块: %+v", chunk)
+			if chunk["action"] != "success" {
+				continue
+			}
 
-			// 处理DuckDuckGo的响应格式
-			if chunk["action"] == "success" {
-				if msg, exists := chunk["message"]; exists && msg != nil {
-					if msgStr, ok := msg.(string); ok {
-						fullResponse.WriteString(msgStr)
-					}
+			if msg, exists := chunk["message"]; exists && msg != nil {
+				if msgStr, ok := msg.(string); ok {
+					fullResponse.WriteString(msgStr)
 				}
-			} else {
-				log.Printf("非success响应: %+v", chunk)
 			}
 		}
 	}
@@ -458,35 +388,41 @@ func requestTokenAndHash() (string, string, error) {
 	return token, vqdHash, nil
 }
 
-func processHashValue(hashValue string) (string, error) {
-	// 直接返回curl示例中工作的hash
-	return "eyJzZXJ2ZXJfaGFzaGVzIjpbIlhjeXJBK0duWGVCZHRPVlJFNGxnOUl2djZHRFFuWmpmdWNhMGlSVUFwYm89IiwiSWRnOVVoVDZxUHEvenR5NWIwNWJuQ09wVVJZR1ZaSXk1bW00UnBaeHpiZz0iXSwiY2xpZW50X2hhc2hlcyI6WyJrZFFzVzJHY3NXR29XUW0zN01QOEp0MHJvMko5d1BkSVhodHhicWRjSGdZPSIsIm1rUzJRZ0VuempqM1NZRjMwUFBFNm0wdUkwczU5RmtqM3IrQ3VYWjFVWGM9Il0sInNpZ25hbHMiOnt9fQ==", nil
-}
+func prepareMessages(messages []struct {
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"`
+}) string {
+	var contentBuilder strings.Builder
 
-func extractArrayFromString(s string) []string {
-	// 简单地提取方括号之间的内容
-	startIdx := strings.Index(s, "[")
-	endIdx := strings.Index(s, "]")
-	
-	if startIdx == -1 || endIdx == -1 || startIdx >= endIdx {
-		return []string{}
-	}
-	
-	arrayContent := s[startIdx+1:endIdx]
-	
-	// 按逗号分隔并移除引号
-	parts := strings.Split(arrayContent, ",")
-	var result []string
-	
-	for _, part := range parts {
-		// 清理引号和空格
-		cleaned := strings.Trim(strings.TrimSpace(part), "\"'")
-		if cleaned != "" {
-			result = append(result, cleaned)
+	for _, msg := range messages {
+		// Determine the role - 'system' becomes 'user'
+		role := msg.Role
+		if role == "system" {
+			role = "user"
 		}
+
+		// Process the content as string
+		contentStr := ""
+		switch v := msg.Content.(type) {
+		case string:
+			contentStr = v
+		case []interface{}:
+			for _, item := range v {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					if text, exists := itemMap["text"].(string); exists {
+						contentStr += text
+					}
+				}
+			}
+		default:
+			contentStr = fmt.Sprintf("%v", msg.Content)
+		}
+
+		// Append the role and content to the builder
+		contentBuilder.WriteString(fmt.Sprintf("%s:%s;\r\n", role, contentStr))
 	}
-	
-	return result
+
+	return contentBuilder.String()
 }
 
 func convertModel(inputModel string) string {
